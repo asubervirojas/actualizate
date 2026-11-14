@@ -1,0 +1,96 @@
+#!/usr/bin/python3 -I
+"""Imprime los casks que `brew upgrade --cask --greedy` debe actualizar, uno por linea.
+Omite los que brew marca como viejos pero cuya app ya esta en esa version o mas nueva
+(porque se actualizo sola, con Sparkle o con msupdate): reinstalarlos seria bajar y
+reinstalar lo mismo, o incluso bajar de version. Si la comparacion es dudosa, lo incluye."""
+import glob, json, os, plistlib, re, subprocess, sys
+
+
+def brew_json(*args):
+    out = subprocess.run(["brew", *args], capture_output=True, text=True).stdout
+    return json.loads(out or "{}").get("casks", [])
+
+
+def strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, list):
+        for x in obj:
+            yield from strings(x)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from strings(v)
+
+
+def bundle_ids():
+    ids = {}
+    for p in glob.glob("/Applications/*.app") + glob.glob("/Applications/*/*.app"):
+        try:
+            with open(f"{p}/Contents/Info.plist", "rb") as f:
+                ids.setdefault(plistlib.load(f).get("CFBundleIdentifier"), p)
+        except Exception:
+            pass
+    return ids
+
+
+def app_paths(cask, ids):
+    """Apps del cask: rutas en los artifacts, bundle ids (quit/launchctl de los casks pkg como
+    AdGuard) y /Applications/<nombre del cask>.app (Office)."""
+    for s in strings(cask.get("artifacts", [])):
+        for m in re.findall(r"[^\"]*?\.app(?=/|$)", s):
+            yield m if m.startswith("/") else f"/Applications/{os.path.basename(m)}"
+        if s in ids:
+            yield ids[s]
+    for name in cask.get("name", []):
+        yield f"/Applications/{name}.app"
+
+
+def nums(v):
+    return tuple(int(x) for x in v.split(".")) if re.fullmatch(r"\d+(\.\d+)*", v or "") else None
+
+
+def already_current(app, cask_version):
+    try:
+        with open(f"{app}/Contents/Info.plist", "rb") as f:
+            info = plistlib.load(f)
+    except Exception:
+        return None
+    ver, _, cask_build = cask_version.partition(",")
+    want = nums(ver)
+    if want is None:
+        return None
+    # "version,build" (app-cleaner 10.0.1,2336): la build tambien tiene que estar al dia
+    if cask_build:
+        build_want, build_have = nums(cask_build), nums(str(info.get("CFBundleVersion", "")).strip())
+        if build_want and not (build_have and len(build_have) == len(build_want) and build_have >= build_want):
+            return None
+    for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+        have = nums(str(info.get(key, "")).strip())
+        # Solo compara versiones con la misma forma (mismo numero de partes). CFBundleVersion
+        # ademas debe tener la misma version mayor: suele ser una build sin relacion
+        # (Updatest 20261013.1821), salvo Office (16.113.26100421)
+        if have and len(have) == len(want) and have >= want and (key != "CFBundleVersion" or have[0] == want[0]):
+            return info.get(key)
+    return None
+
+
+def main():
+    outdated = brew_json("outdated", "--cask", "--greedy", "--json=v2")
+    if not outdated:
+        return 0
+    tokens = [c["name"] for c in outdated]
+    info = {c["token"]: c for c in brew_json("info", "--cask", "--json=v2", *tokens)}
+    ids = bundle_ids()
+    for c in outdated:
+        token, version = c["name"], c["current_version"]
+        apps = [p for p in dict.fromkeys(app_paths(info.get(token, {}), ids)) if os.path.isdir(p)]
+        have = next((v for v in (already_current(a, version) for a in apps) if v), None)
+        if have:
+            print(f"  {token}: ya al dia en {have} (se actualizo fuera de brew)", file=sys.stderr)
+        else:
+            print(token)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

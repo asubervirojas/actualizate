@@ -1,0 +1,280 @@
+#!/usr/bin/python3 -I
+"""Apps de /Applications con Sparkle (SUFeedURL) que el fabricante ya actualizo y brew todavia no.
+Sin argumentos solo lista; con --instalar las actualiza:
+  - updates tipo app: sparkle-cli (~/.local/opt/sparkle.app), instalador oficial de Sparkle,
+    valida la firma EdDSA del fabricante, cierra y reabre la app.
+  - updates tipo package (AdGuard): sparkle-cli no puede (exige firma con el Team ID del
+    fabricante), asi que se baja el instalador, se valida la firma EdDSA con la llave publica de
+    la app, que el .pkg este firmado por el mismo Team ID que la app instalada y notarizado,
+    y se instala con `sudo installer`, igual que el cask de brew.
+Opciones:
+  --sin-escalonado  no espera el rollout escalonado (sparkle:phasedRolloutInterval): el probe de
+                    Sparkle es en segundo plano y respeta el grupo de la Mac; la instalacion es
+                    una busqueda manual y lo ignora, igual que "Buscar actualizaciones" en la app.
+  --betas           incluye los items con sparkle:channel (betas/pre-release) del appcast."""
+import glob, os, platform, plistlib, re, shutil, subprocess, sys, tempfile, time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+
+NS = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+SPARKLE = os.path.expanduser("~/.local/opt/sparkle.app/Contents/MacOS/sparkle")
+VERIFY = os.path.expanduser("~/.local/bin/ed25519-verify")
+# Codigos de salida de sparkle-cli (Sparkle 2.10.0, sparkle-cli/SPUCommandLineDriver.m)
+BETAS = "--betas" in sys.argv[1:]
+SIN_ESCALONADO = "--sin-escalonado" in sys.argv[1:]
+CLI_EXIT = {2: "upgrade mayor no permitido", 3: "requiere autorizacion", 4: "sparkle no ve update",
+            5: "cancelaste la autorizacion", 6: "permiso de chequeo pedido",
+            8: "macOS/Gatekeeper no dejo reemplazar la app"}
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def vkey(v):
+    # Aproximacion al comparador de Sparkle; la decision final la toma `sparkle --probe`
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.findall(r"\d+|[A-Za-z]+", v or "")]
+
+
+def apps():
+    for path in sorted(glob.glob("/Applications/*.app") + glob.glob("/Applications/*/*.app")):
+        info = read_info(path)
+        if info.get("SUFeedURL"):
+            yield path, info
+
+
+def read_info(path):
+    try:
+        with open(f"{path}/Contents/Info.plist", "rb") as f:
+            return plistlib.load(f)
+    except Exception:
+        return {}
+
+
+def feed_item(feed, os_ver, build):
+    """Item instalable mas nuevo del appcast, con los filtros principales de Sparkle.
+    Devuelve dict, None si no hay ninguno, o "error" si no se pudo leer el feed."""
+    try:
+        xml = subprocess.run(["curl", "-sfL", "--max-time", "15", feed],
+                             capture_output=True, timeout=20).stdout
+        root = ET.fromstring(xml)
+    except Exception:
+        return "error"
+    best = None
+    # Con --betas se aceptan todos los canales del feed y se le pasan a sparkle-cli (--channels)
+    channels = {c.strip() for c in (i.findtext(f"{NS}channel") for i in root.iter("item")) if c and c.strip()} if BETAS else set()
+    for item in root.iter("item"):
+        enc = item.find("enclosure")
+        channel = (item.findtext(f"{NS}channel") or "").strip()
+        if enc is None or (channel and channel not in channels) or item.find(f"{NS}informationalUpdate") is not None:
+            continue
+        if enc.get(f"{NS}os") not in (None, "macos"):
+            continue
+        get = lambda k: item.findtext(f"{NS}{k}") or enc.get(f"{NS}{k}")
+        ver, min_os, max_os = get("version"), get("minimumSystemVersion"), get("maximumSystemVersion")
+        hw, min_upd = get("hardwareRequirements"), get("minimumUpdateVersion")
+        if not ver or (min_os and vkey(min_os) > vkey(os_ver)) or (max_os and vkey(max_os) < vkey(os_ver)):
+            continue
+        if (hw and "arm64" not in hw and platform.machine() == "arm64") or (min_upd and vkey(build) < vkey(min_upd)):
+            continue
+        if best is None or vkey(ver) > vkey(best["build"]):
+            best = {"build": ver, "short": get("shortVersionString") or ver, "url": enc.get("url"),
+                    "sig": enc.get(f"{NS}edSignature"), "type": enc.get(f"{NS}installationType") or "application",
+                    "channel": channel, "channels": channels, "phased": bool(get("phasedRolloutInterval"))}
+    return best
+
+
+def channel_args(channels):
+    return ["--channels", ",".join(sorted(channels))] if channels else []
+
+
+def probe(path, bid, channels=()):
+    """True/False segun Sparkle mismo (su comparador y filtros); None si no se pudo preguntar."""
+    if not os.access(SPARKLE, os.X_OK):
+        return None
+    # El probe escribe SULastCheckTime en las preferencias de la app y le atrasaria su propio
+    # chequeo programado: se guarda y se restaura
+    before = run(["defaults", "read", bid, "SULastCheckTime"]) if bid else None
+    try:
+        rc = run([SPARKLE, path, "--probe", "--allow-major-upgrades", "--user-agent-name", "actualizar",
+                  *channel_args(channels)], timeout=60).returncode
+    except subprocess.TimeoutExpired:
+        rc = None
+    if before and before.returncode == 0:
+        run(["defaults", "write", bid, "SULastCheckTime", "-date", before.stdout.strip()])
+    elif before:
+        run(["defaults", "delete", bid, "SULastCheckTime"])
+    return {0: True, 4: False}.get(rc)
+
+
+def check(app, os_ver):
+    path, info = app
+    build = str(info.get("CFBundleVersion", ""))
+    item = feed_item(info["SUFeedURL"], os_ver, build)
+    has_item = isinstance(item, dict)
+    pending = probe(path, info.get("CFBundleIdentifier"), item["channels"] if has_item else ())
+    if pending is None and has_item:  # sin sparkle-cli: comparacion propia
+        pending = vkey(item["build"]) > vkey(build)
+    elif pending is False and SIN_ESCALONADO and has_item and item["phased"] and vkey(item["build"]) > vkey(build):
+        # Sparkle la retiene solo por el grupo del rollout escalonado
+        pending = True
+    elif pending and not (has_item and item["build"] != build):
+        # Sparkle ve algo pero no hay descarga instalable (aviso informativo del fabricante)
+        pending = "info"
+    return pending, item
+
+
+def team_id(path):
+    out = run(["codesign", "-dv", path]).stderr
+    m = re.search(r"^TeamIdentifier=(\w+)$", out, re.M)
+    return m.group(1) if m else None
+
+
+def install_pkg(path, info, item):
+    pub, sig, url = info.get("SUPublicEDKey"), item["sig"], item["url"]
+    if not (pub and sig and url):
+        return "el feed no trae firma EdDSA o URL; no se instala"
+    tmp = tempfile.mkdtemp(prefix="sparkle-pkg-")
+    dev = None
+    try:
+        dl = os.path.join(tmp, "update")
+        if subprocess.run(["curl", "-fL", "--progress-bar", "--max-time", "1800", "-o", dl, url]).returncode:
+            return "fallo la descarga"
+        if run([VERIFY, pub, sig, dl]).returncode != 0:
+            return "la firma EdDSA del fabricante NO coincide; descartado"
+        # Se trabaja sobre una copia con nombre fijo: pkgutil repite el nombre del archivo en su
+        # salida y ese nombre lo elige quien arma la imagen
+        pkg = os.path.join(tmp, "update.pkg")
+        with open(dl, "rb") as f:
+            magic = f.read(4)
+        if magic == b"xar!":
+            os.rename(dl, pkg)
+        else:
+            mnt = os.path.join(tmp, "mnt")
+            os.mkdir(mnt)
+            r = run(["diskutil", "image", "attach", "--readOnly", "--nobrowse", "--mountPoint", mnt, dl])
+            if r.returncode:
+                return "no se pudo montar la imagen descargada"
+            dev = r.stdout.split()[0]
+            pkgs = sorted(glob.glob(f"{mnt}/*.pkg") + glob.glob(f"{mnt}/*.mpkg"))
+            if len(pkgs) != 1 or not os.path.isfile(pkgs[0]):
+                return f"se esperaba un .pkg (archivo) en la imagen y hay {len(pkgs)}"
+            shutil.copyfile(pkgs[0], pkg)
+            run(["diskutil", "eject", dev])
+            dev = None
+        sig_out = run(["pkgutil", "--check-signature", pkg]).stdout
+        app_team = team_id(path)
+        m = re.search(r"^\s+1\. Developer ID Installer: .*\((\w+)\)$", sig_out, re.M)
+        if not (app_team and m and m.group(1) == app_team
+                and re.search(r"^\s+Status: signed by a developer certificate issued by Apple for distribution$", sig_out, re.M)
+                and re.search(r"^\s+Notarization: trusted by the Apple notary service$", sig_out, re.M)):
+            return f"el .pkg no esta firmado y notarizado por el mismo desarrollador que la app ({app_team}); descartado"
+        if run(["spctl", "-a", "-t", "install", pkg]).returncode:
+            return "Gatekeeper rechazo el .pkg; descartado"
+        # Version que trae el .pkg (Distribution va dentro de la firma): no permite bajar de version
+        bid = info.get("CFBundleIdentifier", "")
+        xdir = os.path.join(tmp, "x")
+        os.mkdir(xdir)
+        run(["xar", "-xf", pkg, "Distribution", "-C", xdir])
+        try:
+            dist = open(os.path.join(xdir, "Distribution"), encoding="utf-8", errors="replace").read()
+        except OSError:
+            dist = ""
+        for tag in re.findall(r"<bundle\b[^>]*>", dist):
+            if f'id="{bid}"' in tag:
+                v = re.search(r'CFBundleVersion="([^"]+)"', tag)
+                if v and vkey(v.group(1)) <= vkey(str(info.get("CFBundleVersion", ""))):
+                    return f"el .pkg trae la version {v.group(1)}, que no es mas nueva que la instalada; descartado"
+        is_running = lambda: run(["osascript", "-e", f'application id "{bid}" is running']).stdout.strip() == "true"
+        running = is_running()
+        if running:
+            # AdGuard tarda mas de un minuto en cerrar (apaga la proteccion antes de salir):
+            # se pide el cierre sin esperar respuesta y se espera hasta 3 min a que salga
+            print("  Cerrando la app (si muestra un dialogo, confirmalo)...", flush=True)
+            try:
+                run(["osascript", "-e", f'ignoring application responses\nquit app id "{bid}"\nend ignoring'], timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            for _ in range(90):
+                if not is_running():
+                    break
+                time.sleep(2)
+            else:
+                return "la app no se cerro en 3 minutos (tiene un dialogo abierto?); no se instalo"
+        print(f"  Firma EdDSA, Team ID {app_team} y notarizacion OK. Instalando...", flush=True)
+        # Ruta completa: la regla sin contrasena de sudoers (zz_actualizate) es para /usr/sbin/installer
+        rc = subprocess.run(["sudo", "/usr/sbin/installer", "-pkg", pkg, "-target", "/"]).returncode
+        if running:
+            run(["open", "-b", bid])
+        return None if rc == 0 else f"installer fallo (codigo {rc})"
+    finally:
+        if dev:
+            run(["diskutil", "eject", dev])
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def install_app(path, channels=()):
+    cmd = [SPARKLE, path, "--check-immediately", "--interactive", "--allow-major-upgrades",
+           "--grant-automatic-checks", "--user-agent-name", "actualizar", *channel_args(channels)]
+    try:
+        rc = subprocess.run(cmd, timeout=900).returncode
+    except subprocess.TimeoutExpired:
+        return "tardo mas de 15 min, cancelado"
+    return None if rc == 0 else CLI_EXIT.get(rc, f"fallo (codigo {rc})")
+
+
+def main():
+    instalar = "--instalar" in sys.argv[1:]
+    os_ver = platform.mac_ver()[0]
+    found = list(apps())
+    with ThreadPoolExecutor(8) as ex:
+        results = list(ex.map(lambda a: check(a, os_ver), found))
+    pending = []
+    for (path, info), (is_pending, item) in zip(found, results):
+        name = os.path.basename(path)[:-4]
+        if is_pending is None:
+            print(f"  ? {name}: no se pudo consultar el feed", file=sys.stderr)
+        elif is_pending == "info":
+            print(f"  {name}: el fabricante publico un aviso sin descarga; revisalo en la app")
+        elif is_pending:
+            new = item["short"] if isinstance(item, dict) else "nueva"
+            if isinstance(item, dict) and item["channel"]:
+                new += f" (beta, canal {item['channel']})"
+            pending.append((path, name, info, item if isinstance(item, dict) else None))
+            print(f"  {name}: {info.get('CFBundleShortVersionString', '?')} -> {new}")
+    if not pending:
+        print("  Nada pendiente.")
+        return 0
+    if not instalar:
+        print("Actualizalas con: sparkle-pendientes --instalar", *sys.argv[1:])
+        return 0
+    if not os.access(SPARKLE, os.X_OK):
+        print(f"  No esta sparkle-cli en {SPARKLE}; no se instalo nada.", file=sys.stderr)
+        return 1
+    failed = 0
+    for path, name, info, item in pending:
+        print(f"==> Actualizando {name} (se cierra y se vuelve a abrir si estaba abierta)...", flush=True)
+        if item and item["type"] in ("package", "guided-package"):
+            err = install_pkg(path, info, item)
+        else:
+            err = install_app(path, item["channels"] if item else ())
+        if not err:
+            # Autoupdate puede terminar de reemplazar la app unos segundos despues de que sale el CLI
+            for _ in range(30):
+                if str(read_info(path).get("CFBundleVersion")) != str(info.get("CFBundleVersion")):
+                    break
+                time.sleep(1)
+            else:
+                err = "termino sin errores pero la version instalada no cambio"
+            if not err and vkey(str(read_info(path).get("CFBundleVersion"))) < vkey(str(info.get("CFBundleVersion"))):
+                err = f"quedo en una version anterior ({read_info(path).get('CFBundleShortVersionString')})"
+        if err:
+            failed += 1
+            print(f"  {name}: {err}", file=sys.stderr)
+        else:
+            print(f"  {name}: actualizada a {read_info(path).get('CFBundleShortVersionString', '?')}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

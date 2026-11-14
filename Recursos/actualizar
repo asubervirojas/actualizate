@@ -1,0 +1,1110 @@
+#!/bin/zsh -f
+# actualizar: revisa e instala actualizaciones de Homebrew, Mac App Store, Sparkle, Microsoft y macOS.
+#
+# Uso:
+#   actualizar [--betas]              revisa e instala todo (lo de siempre)
+#   actualizar revisar [--betas]      solo revisa, en paralelo; no instala ni cambia nada
+#   actualizar instalar [opciones]    instala; sin listas, todo lo pendiente
+#   actualizar adoptables             lista todas las apps instaladas y cuales puede adoptar Homebrew
+#   actualizar adoptar --casks a,b    instala la copia de Homebrew y retira originales duplicados
+#
+# Opciones de instalar:
+#   --etapas a,b     solo esas etapas: propios formulas casks mas sparkle manuales macos microsoft
+#   --propios a,b    --formulas a,b    --casks a,b    --mas id,id
+#                    limitan cada etapa a esos elementos (sin la opcion, todo lo pendiente)
+#   --betas          incluye betas de Sparkle (sparkle:channel)
+#
+# Con ACTUALIZAR_APP=1 ademas del texto emite marcas para la app Actualizate: lineas que empiezan
+# con \x1e y separan campos con \x1f (ETAPA, ITEM, NOTA, FIN, ADOPTABLE, ADOPTADA).
+
+MOTOR=${0:A}
+zmodload zsh/system
+autoload -Uz is-at-least
+setopt extended_glob no_bg_nice
+
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+export LANG=${LANG:-en_US.UTF-8}
+# Homebrew 7 pregunta [y/n] antes de cada upgrade/install; aqui ya se eligio que instalar
+export HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_EMOJI=1 HOMEBREW_NO_ASK=1
+
+# ---------------------------------------------------------------------------------------------
+# Configuracion
+
+# Casks de tu propio tap de Homebrew que se suben de version a mano (opcional). Formato:
+#   cask|url de latest-mac.yml o github:dueno/repo|url de descarga con {v} en lugar de la version
+# Ejemplo:
+#   "mi-app|https://ejemplo.com/latest-mac.yml|https://ejemplo.com/MiApp-{v}.dmg"
+#   "otra-app|github:dueno/otra-app|https://github.com/dueno/otra-app/releases/download/v{v}/OtraApp.zip"
+PROPIOS=(
+)
+# Tap donde estan esos casks (brew tap-new usuario/local)
+TAP=
+
+# Apps sin brew ni Sparkle: solo se avisa (opcional). nombre|app|funcion que imprime la ultima version|url
+# Ejemplo:
+#   "Mi VPN|/Applications/Mi VPN.app|_ultima_mivpn|https://ejemplo.com/descargas"
+# con la funcion:
+#   _ultima_mivpn() { curl -fsS -m 15 https://ejemplo.com/api/ultima | jq -r .version }
+MANUALES=(
+)
+
+MSUPDATE="/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app/Contents/MacOS/msupdate"
+# Ayudante privilegiado que instala de verdad; sin el, AutoUpdate descarga pero se queda en "Installing"
+MS_AYUDANTE=/Library/PrivilegedHelperTools/com.microsoft.autoupdate.helper
+# msupdate --list pasa ~45 s callado mientras consulta: cortarlo antes da falsos errores
+MS_LISTA_QUIETO=150 MS_LISTA_MAX=300
+# Al instalar, cuanto se espera a que AutoUpdate termine (Office pesa varios GB) y cada cuanto se mira
+MS_ESPERA_MAX=2700 MS_INTERVALO=30
+URL_SOFTWARE_UPDATE="x-apple.systempreferences:com.apple.Software-Update-Settings.extension"
+
+ETAPAS=(propios formulas casks mas sparkle manuales macos microsoft)
+typeset -A TITULO=(
+  propios  "Casks propios${TAP:+ ($TAP)}"
+  formulas "Homebrew: formulas"
+  casks    "Homebrew: apps (casks)"
+  mas      "Mac App Store"
+  sparkle  "Apps con Sparkle mas nuevas que brew"
+  manuales "Apps sin brew ni Sparkle"
+  macos    "macOS y Safari"
+  microsoft "Microsoft"
+)
+
+# ---------------------------------------------------------------------------------------------
+# Salida
+
+_marca() {
+  [[ -n $ACTUALIZAR_APP ]] || return 0
+  local IFS=$'\x1f'
+  print -r -- $'\x1e'"$*"
+}
+
+_titulo() {
+  if [[ -t 1 && -z $ACTUALIZAR_APP ]]; then
+    print -r -- $'\e[1;34m==>\e[0;1m '"$1"$'\e[0m'
+  else
+    print -r -- "==> $1"
+  fi
+}
+
+# _item etapa clave nombre actual nueva [url]
+_item() {
+  (( N_ITEMS++ ))
+  local url=$6
+  [[ $url == http* ]] || url=
+  print -r -- "  $3: ${4:+$4 -> }$5${url:+  ($url)}"
+  _marca ITEM "$@"
+}
+
+# _nota etapa texto
+_nota() {
+  print -r -- "  $2"
+  _marca NOTA "$1" "$2"
+}
+
+_duracion() {
+  local s=$1
+  (( s >= 60 )) && print -r -- "$(( s / 60 ))m $(( s % 60 ))s" || print -r -- "${s}s"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Casks propios
+
+_tap_dir() {
+  [[ -n $TAP_DIR ]] || TAP_DIR=$(brew --repository $TAP)
+  print -r -- $TAP_DIR
+}
+
+_propio_actual() {
+  local rb="$(_tap_dir)/Casks/$1.rb"
+  [[ -f $rb ]] || return 1
+  awk -F'"' '/^  version/ {print $2; exit}' "$rb"
+}
+
+_propio_ultima() {
+  local feed=$1
+  if [[ $feed == github:* ]]; then
+    curl -fsSL -m 20 "https://api.github.com/repos/${feed#github:}/releases/latest" |
+      jq -r '.tag_name // empty | ltrimstr("v")'
+  else
+    curl -fsSL -m 20 "$feed" | awk '/^version:/ {gsub(/["\047]/, "", $2); print $2; exit}'
+  fi
+}
+
+_revisar_propios() {
+  local def token feed tpl actual nueva rc=0
+  for def in $PROPIOS; do
+    IFS='|' read -r token feed tpl <<< "$def"
+    if ! actual=$(_propio_actual $token); then
+      _nota propios "$token: no esta en $TAP"; rc=1; continue
+    fi
+    nueva=$(_propio_ultima "$feed")
+    if [[ -z $nueva ]]; then
+      _nota propios "$token: no se pudo consultar la ultima version"; rc=1; continue
+    fi
+    if is-at-least "$nueva" "$actual"; then
+      print -r -- "  $token: $actual al dia"
+    else
+      _item propios $token $token $actual $nueva
+    fi
+  done
+  return rc
+}
+
+# Sube version y sha256 del cask en el tap (descarga una vez para calcular el sha256 y deja la
+# descarga en el cache de brew) y despues lo actualiza
+_instalar_propios() {
+  local def token feed tpl rb actual nueva tmp sha rc=0
+  local -a subidos
+  for def in $PROPIOS; do
+    IFS='|' read -r token feed tpl <<< "$def"
+    (( $#SEL_PROPIOS )) && (( ! ${SEL_PROPIOS[(Ie)$token]} )) && continue
+    if ! actual=$(_propio_actual $token); then
+      print -r -- "  $token: no esta en $TAP"; rc=1; continue
+    fi
+    nueva=$(_propio_ultima "$feed")
+    if [[ -z $nueva ]]; then
+      print -r -- "  $token: no se pudo consultar la ultima version"; rc=1; continue
+    fi
+    if is-at-least "$nueva" "$actual"; then
+      print -r -- "  $token: $actual al dia"; continue
+    fi
+    print -r -- "  $token: $actual -> $nueva, descargando para calcular sha256..."
+    tmp=$(mktemp -d)
+    if ! curl -fL --progress-bar -m 1800 -o "$tmp/descarga" "${tpl//\{v\}/$nueva}"; then
+      print -r -- "  $token: fallo la descarga"; rm -rf "$tmp"; rc=1; continue
+    fi
+    sha=$(shasum -a 256 "$tmp/descarga" | awk '{print $1}')
+    rb="$(_tap_dir)/Casks/$token.rb"
+    sed -i '' -e "s/^  version \".*\"/  version \"$nueva\"/" -e "s/^  sha256 \".*\"/  sha256 \"$sha\"/" "$rb"
+    mv "$tmp/descarga" "$(brew --cache --cask "$TAP/$token")"
+    rm -rf "$tmp"
+    subidos+=($token)
+  done
+  if (( $#subidos )); then
+    brew upgrade --cask --greedy $subidos || rc=1
+  fi
+  return rc
+}
+
+# ---------------------------------------------------------------------------------------------
+# Homebrew
+
+_brew_update() {
+  (( BREW_ACTUALIZADO )) && return 0
+  BREW_ACTUALIZADO=1
+  brew update
+}
+
+_revisar_formulas() {
+  _brew_update || _nota formulas "brew update fallo; la lista puede estar desactualizada"
+  local json name actual nueva
+  json=$(brew outdated --formula --json=v2) || return 1
+  jq -r '.formulae[] | select(.pinned | not)
+         | [.name, (.installed_versions | if type == "array" then join(", ") else tostring end), .current_version]
+         | @tsv' <<< $json |
+  while IFS=$'\t' read -r name actual nueva; do
+    _item formulas $name $name $actual $nueva
+  done
+  jq -r '.formulae[] | select(.pinned) | .name' <<< $json |
+  while read -r name; do
+    _nota formulas "$name: fijada con brew pin, no se actualiza"
+  done
+}
+
+_instalar_formulas() {
+  _brew_update
+  brew upgrade --formula $SEL_FORMULAS
+}
+
+# Casks con --greedy, menos los que la app ya tiene (se actualizaron con Sparkle o msupdate):
+# asi brew no reinstala la misma version ni baja de version
+_revisar_casks() {
+  _brew_update || _nota casks "brew update fallo; la lista puede estar desactualizada"
+  local -a tokens
+  tokens=(${(f)"$(brew-casks-pendientes)"}) || return 1
+  tokens=(${tokens:#})
+  (( $#tokens )) || return 0
+  local json name actual nueva
+  json=$(brew outdated --cask --greedy --json=v2) || return 1
+  jq -r '.casks[]
+         | [.name, (.installed_versions | if type == "array" then join(", ") else tostring end), .current_version]
+         | @tsv' <<< $json |
+  while IFS=$'\t' read -r name actual nueva; do
+    (( ${tokens[(Ie)$name]} )) && _item casks $name $name $actual $nueva
+  done
+}
+
+_instalar_casks() {
+  _brew_update
+  local -a casks
+  if (( $#SEL_CASKS )); then
+    casks=($SEL_CASKS)
+  else
+    casks=(${(f)"$(brew-casks-pendientes)"})
+    casks=(${casks:#})
+  fi
+  if (( ! $#casks )); then
+    print -r -- "  Nada pendiente."
+    return 0
+  fi
+  brew upgrade --cask --greedy $casks
+}
+
+# ---------------------------------------------------------------------------------------------
+# Mac App Store
+
+_revisar_mas() {
+  local out linea rc
+  out=$(mas outdated 2>&1); rc=$?
+  for linea in ${(f)out}; do
+    if [[ $linea =~ '^ *([0-9]+) +(.*[^ ]) +\((.*) -> (.*)\) *$' ]]; then
+      _item mas $match[1] $match[2] ${match[3]// /} ${match[4]// /}
+    elif [[ -n ${linea// /} ]]; then
+      _nota mas "$linea"
+    fi
+  done
+  return rc
+}
+
+# mas 7 se vuelve a lanzar con sudo para instalar: pide Touch ID o la contrasena por su cuenta
+_instalar_mas() {
+  mas upgrade $SEL_MAS
+}
+
+# ---------------------------------------------------------------------------------------------
+# Sparkle
+
+_revisar_sparkle() {
+  local out linea rc
+  out=$(sparkle-pendientes --sin-escalonado $BETAS 2>&1); rc=$?
+  for linea in ${(f)out}; do
+    case $linea in
+      ("  ? "*) _nota sparkle "${linea#  \? }" ;;
+      ("Actualizalas con:"*|"  Nada pendiente.") ;;
+      (*)
+        if [[ $linea =~ '^  (.+): (.+) -> (.+)$' ]]; then
+          _item sparkle "$match[1]" "$match[1]" "$match[2]" "$match[3]"
+        elif [[ -n ${linea// /} ]]; then
+          _nota sparkle "${linea##  #}"
+        fi ;;
+    esac
+  done
+  return rc
+}
+
+# Tipo app: sparkle-cli. Tipo pkg (AdGuard): firma EdDSA + Team ID + notarizacion y sudo installer.
+# Se vuelve a revisar aqui, despues de brew: lo que brew ya actualizo no se repite
+_instalar_sparkle() {
+  sparkle-pendientes --instalar --sin-escalonado $BETAS
+}
+
+# ---------------------------------------------------------------------------------------------
+# Apps sin brew ni Sparkle (solo aviso)
+
+_revisar_manuales() {
+  local def nombre app fn url actual nueva rc=0
+  for def in $MANUALES; do
+    IFS='|' read -r nombre app fn url <<< "$def"
+    [[ -d $app ]] || continue
+    actual=$(defaults read "$app/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+    nueva=$($fn)
+    if [[ -z $nueva ]]; then
+      _nota manuales "$nombre: no se pudo consultar la ultima version"; rc=1
+    elif is-at-least "$nueva" "$actual"; then
+      print -r -- "  $nombre: $actual al dia"
+    else
+      _item manuales "$nombre" "$nombre" "$actual" "$nueva" "$url"
+    fi
+  done
+  return rc
+}
+_instalar_manuales() { _revisar_manuales }
+
+# ---------------------------------------------------------------------------------------------
+# macOS y Safari: solo aviso, porque suelen pedir reinicio
+
+_revisar_macos() {
+  local out linea etiqueta= rc
+  out=$(softwareupdate --list 2>&1); rc=$?
+  for linea in ${(f)out}; do
+    case $linea in
+      ("Software Update Tool"|"Finding available software"|"Software Update found the following new or updated software:"|"No new software available."|"") ;;
+      ("* Label: "*) etiqueta=${linea#\* Label: } ;;
+      (*Title:*)
+        if [[ $linea =~ 'Title: ([^,]+), Version: ([^,]+)' ]]; then
+          _item macos "${etiqueta:-$match[1]}" "$match[1]" "" "$match[2]" "$URL_SOFTWARE_UPDATE"
+        else
+          _nota macos "${linea##[[:space:]]#}"
+        fi
+        etiqueta= ;;
+      (*) _nota macos "$linea" ;;
+    esac
+  done
+  return rc
+}
+_instalar_macos() { _revisar_macos }
+
+# ---------------------------------------------------------------------------------------------
+# Microsoft AutoUpdate
+
+# Pausa manual compartida entre la app y el comando de terminal (Ajustes > Pausar Microsoft
+# AutoUpdate). Activa por defecto; un fallo ya no la pausa sola. Clave nueva: la vieja,
+# microsoftPausado, la escribia la pausa automatica y no refleja lo que eligio el usuario.
+_ms_pausado() {
+  local valor=${ACTUALIZAR_MICROSOFT_PAUSADO:-$(defaults read local.armando.actualizar microsoftPausaManual 2>/dev/null)}
+  [[ ${valor:-0} != 0 ]]
+}
+
+# Corre msupdate con limites y codigo de salida real. No reinicia AutoUpdate, no abre Office
+# para registrarlo y no cierra aplicaciones. Conserva el XML completo, sin deduplicarlo.
+_msupdate_run() {
+  local idle=$1 max=$2
+  shift 2
+  local log pid rc=0 t=0 quieto=0 tam=-1 nuevo
+  log=$(mktemp) || return 1
+  {
+    "$MSUPDATE" "$@" > "$log" 2>&1 &
+    pid=$!
+    while kill -0 $pid 2>/dev/null; do
+      sleep 2
+      (( t += 2 ))
+      nuevo=$(stat -f %z "$log")
+      if (( nuevo == tam )); then
+        (( quieto += 2 ))
+      else
+        quieto=0 tam=$nuevo
+      fi
+      if (( t >= max || quieto >= idle || nuevo > 5242880 )); then
+        # msupdate deja su ultima linea de estado sin salto: el aviso va en una linea propia
+        print -r -- $'\n'"Microsoft AutoUpdate: tiempo de espera agotado o salida excesiva." >> "$log"
+        kill -TERM $pid 2>/dev/null
+        sleep 1
+        kill -KILL $pid 2>/dev/null
+        rc=124
+        break
+      fi
+    done
+    local proceso_rc=0
+    wait $pid 2>/dev/null || proceso_rc=$?
+    (( rc )) || rc=$proceso_rc
+    # No se eliminan lineas repetidas: </dict> y otras etiquetas son necesarias en cada item.
+    tr '\r' '\n' < "$log" | sed $'s/\e[[]2K//g'
+    if (( rc == 0 )) && grep -qiE 'error|failed|failure|timeout|XPC Connection' "$log"; then
+      rc=1
+    fi
+  } always {
+    kill -TERM $pid 2>/dev/null
+    rm -f "$log"
+  }
+  return rc
+}
+
+_ms_lista() { _msupdate_run $MS_LISTA_QUIETO $MS_LISTA_MAX --list --format plist }
+
+_ms_ayudante_ok() { [[ -x $MS_AYUDANTE ]] }
+
+# Solo una lista valida permite decir "al dia". Una respuesta vacia o incompleta es un error.
+_ms_json() {
+  local lista=$1 json
+  json=$(print -r -- "$lista" | sed -n '/^<?xml/,/^<\/plist>/p' | plutil -convert json -o - - 2>/dev/null) || {
+    [[ $lista == *"No updates available"* ]] || return 1
+    json='{}'
+  }
+  jq -e 'type == "object" and all(.[]; type == "object" and (.Title | type == "string"))' <<< "$json" >/dev/null || return 1
+  print -r -- "$json"
+}
+
+_ms_version_instalada() {
+  [[ -d "/Applications/$1.app" ]] && defaults read "/Applications/$1.app/Contents/Info" CFBundleShortVersionString 2>/dev/null
+}
+
+_ms_items() {
+  local json
+  json=$(_ms_json "$1") || { _nota microsoft "AutoUpdate no devolvio una lista valida."; return 1 }
+  _ms_items_json "$json"
+}
+
+_ms_items_json() {
+  local json=$1 id titulo nombre version
+  while IFS=$'\t' read -r id titulo; do
+    [[ -n $id ]] || continue
+    if [[ $titulo =~ '^(.+) Update ([0-9][0-9.]*)' ]]; then
+      nombre=$match[1] version=$match[2]
+    else
+      nombre=$titulo version=nueva
+    fi
+    _item microsoft "$id" "$nombre" "$(_ms_version_instalada "$nombre")" "$version"
+  done < <(jq -r 'to_entries[] | [.key, .value.Title] | @tsv' <<< "$json")
+}
+
+_ms_fallo() {
+  local linea
+  for linea in ${(f)1}; do
+    [[ $linea == (*[Ee]rror*|*[Ff]ail*|*Timeout*|*XPC*|*agotado*) ]] && _nota microsoft "$linea"
+  done
+  [[ $1 == *XPC* ]] && _nota microsoft "Suele pasar si Microsoft AutoUpdate esta apagado en Ajustes > General > Items de inicio y extensiones."
+  return 1
+}
+
+# Reinstala Microsoft AutoUpdate con su paquete oficial (cask microsoft-auto-update): el paquete
+# vuelve a poner el ayudante en /Library/PrivilegedHelperTools y lo registra en launchd
+_ms_reparar_ayudante() {
+  print -r -- "  Falta el ayudante de instalacion de Microsoft AutoUpdate; reinstalando Microsoft AutoUpdate con Homebrew..."
+  local accion=install
+  brew list --cask microsoft-auto-update >/dev/null 2>&1 && accion=reinstall
+  brew $accion --cask microsoft-auto-update || return 1
+  if ! _ms_ayudante_ok; then
+    print -r -- "  El ayudante sigue faltando despues de reinstalar Microsoft AutoUpdate."
+    return 1
+  fi
+  print -r -- "  Ayudante de Microsoft AutoUpdate reparado."
+}
+
+_revisar_microsoft() {
+  [[ -x $MSUPDATE ]] || { _nota microsoft "Microsoft AutoUpdate no esta instalado."; return 1 }
+  local lista json
+  # La linea de estado puede traer el error de una instalacion anterior ("Error:%@ [OPIM2019]"):
+  # si el plist llego completo, la lista vale igual
+  lista=$(_ms_lista)
+  if ! json=$(_ms_json "$lista"); then
+    _ms_fallo "$lista"
+    _ms_ayudante_ok || _nota microsoft "Falta el ayudante de instalacion de Microsoft AutoUpdate; se repara solo al actualizar."
+    return 1
+  fi
+  _ms_items_json "$json"
+  [[ $lista == *"Error:"* ]] && _nota microsoft "AutoUpdate guarda un error de su ultima instalacion; se reintenta al actualizar."
+  if (( N_ITEMS )) && ! _ms_ayudante_ok; then
+    _nota microsoft "Falta el ayudante de instalacion de Microsoft AutoUpdate: descarga pero no puede instalar. Se repara solo al actualizar."
+  elif [[ $lista == *"Installing: ["* ]]; then
+    _nota microsoft "AutoUpdate ya las tiene en cola; al actualizar se espera a que termine."
+  fi
+  return 0
+}
+
+# Pide la instalacion y espera a que AutoUpdate la termine, mirando la lista cada MS_INTERVALO s
+_instalar_microsoft() {
+  [[ -x $MSUPDATE ]] || { _nota microsoft "Microsoft AutoUpdate no esta instalado."; return 1 }
+  local lista json ultimo salida nombres
+  local -a ids restantes
+  # Con el ayudante roto la lista misma puede fallar: se repara antes de preguntar
+  if ! _ms_ayudante_ok; then
+    _ms_reparar_ayudante || { _ms_fallo "Error: no se pudo reparar el ayudante de Microsoft AutoUpdate."; return 1 }
+  fi
+  lista=$(_ms_lista)
+  json=$(_ms_json "$lista") || { _ms_fallo "$lista"; return 1 }
+  ids=(${(f)"$(jq -r 'keys[]' <<< "$json")"})
+  if (( ! $#ids )); then
+    print -r -- "  Microsoft: al dia"
+    return 0
+  fi
+  _nota microsoft "Actualizando con Microsoft AutoUpdate; Office pesa varios GB y puede tardar. Si una app esta abierta, guarda tu trabajo y cierrala."
+  salida=$(_msupdate_run 300 900 --install --apps $ids --wait 600)
+  local rc=$?
+  print -r -- "$salida" | grep -vE '^(<|[[:space:]]|$)'
+  # La orden puede repetir errores viejos en su estado o cortarse por tiempo (124) mientras
+  # AutoUpdate sigue instalando por su cuenta: lo que vale es la lista que queda al final
+  (( rc )) && print -r -- "  AutoUpdate respondio con avisos (codigo $rc); se sigue su avance."
+  local inicio=$SECONDS fallos=0
+  ultimo=$json
+  while :; do
+    lista=$(_ms_lista)
+    if json=$(_ms_json "$lista"); then
+      fallos=0
+      # Solo lo que se pidio: algo nuevo que aparezca mientras tanto no es un fallo de esta instalacion
+      ultimo=$(jq -c 'with_entries(select(.key as $k | $ARGS.positional | index($k)))' --args $ids <<< "$json")
+      restantes=(${(f)"$(jq -r 'keys[]' <<< "$ultimo")"})
+      (( $#restantes )) || break
+      nombres=$(jq -r '[.[].Title | sub(" Update .*"; "")] | join(", ")' <<< "$ultimo")
+      print -r -- "  Microsoft AutoUpdate sigue con: $nombres ($(_duracion $(( SECONDS - inicio ))))"
+    else
+      (( ++fallos >= 3 )) && { _ms_fallo "$lista"; return 1 }
+    fi
+    (( SECONDS - inicio >= MS_ESPERA_MAX )) && break
+    sleep $MS_INTERVALO
+  done
+  # Lo pedido que haya quedado sin instalar se muestra como pendiente y la etapa termina con error
+  _ms_items_json "$ultimo"
+  if (( N_ITEMS )); then
+    _ms_fallo "Error: AutoUpdate no termino de instalar en $(_duracion $(( SECONDS - inicio ))); sigue en segundo plano. Revisa de nuevo mas tarde."
+    return 1
+  fi
+  print -r -- "  Microsoft: actualizado"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Adoptar apps: instala la copia del cask, respalda la anterior y retira duplicados solo
+# despues de verificar el registro de Homebrew, la identidad y el ejecutable de la app.
+
+_cask_desde_nombre() {
+  local n=${(L)1}
+  n=${n//[ _]/-}
+  n=${n//[^a-z0-9.+-]/}
+  n=${n//-##/-}
+  n=${n##-}
+  print -r -- ${n%%-}
+}
+
+# Carpetas de apps, incluidas las de macOS. La primera es el destino habitual de Homebrew.
+CARPETAS_APPS=(/Applications "$HOME/Applications" /System/Applications)
+
+# Inventario de todas las apps instaladas, cada una con su estado frente a Homebrew:
+#   si / paquete / version   tiene cask y no la maneja Homebrew (adoptable, con paquete, version distinta)
+#   brew  ya la maneja un cask instalado    mas  App Store    apple  de Apple (y apps web de Safari)
+#   sincask  sin cask en Homebrew    fuera  tiene cask pero no esta en /Applications
+#   deshabilitado  su cask esta retirado en Homebrew
+_adoptables_todo() {
+  local app nombre base t token version auto apps arts bid instalada estado json inst c dis catalogo filas
+  local -a todas
+  local -A existe app_cask nombre_cask artefactos cand_token info_version info_auto info_apps info_arts info_dis
+  local -A cuenta
+  _titulo "Apps instaladas"
+  if ! inst=$(brew info --cask --json=v2 --installed); then
+    print -u2 -- "Error: no se pudieron consultar los casks instalados de Homebrew."
+    return 1
+  fi
+  if ! jq -e '(.casks | type) == "array" and all(.casks[];
+      (.token | type) == "string" and (.artifacts | type) == "array")' <<< "$inst" >/dev/null 2>&1; then
+    print -u2 -- "Error: Homebrew devolvio un inventario no valido."
+    return 1
+  fi
+  # El JSON local de Homebrew incluye el destino real del artefacto (.target).
+  if ! filas=$(jq -r --arg destino "${CARPETAS_APPS[1]}" '.casks[] | [.token,
+      ([.artifacts[] | select(has("app")) | .target //
+        ([.app[] | select(type == "object") | .target][0]) //
+        ($destino + "/" + ([.app[] | select(type == "string")][0] | split("/") | last))]
+        | if length == 0 then "-" else join("|") end),
+      (.artifacts | tojson)] | @tsv' <<< "$inst"); then
+    print -u2 -- "Error: no se pudieron interpretar los destinos de los casks instalados."
+    return 1
+  fi
+  # Casks instalados: destino -> cask; los casks con paquete solo traen bundle ids.
+  while IFS=$'\t' read -r token apps arts; do
+    [[ -n $token ]] || continue
+    artefactos[$token]=$arts
+    [[ $apps == - ]] && continue
+    for app in ${(s:|:)apps}; do
+      app_cask[$app]=$token
+      nombre_cask[${app:t}]=$token
+    done
+  done <<< "$filas"
+  if ! catalogo=$(brew casks); then
+    print -u2 -- "Error: no se pudo consultar el catalogo de Homebrew."
+    return 1
+  fi
+  for token in ${(f)catalogo}; do [[ -n $token ]] && existe[$token]=1; done
+  for token in ${(k)artefactos}; do unset "existe[$token]"; done
+
+  for c in $CARPETAS_APPS; do todas+=($c/*.app(N) $c/*/*.app(N)); done
+  todas=(${(u)todas})
+  for app in $todas; do
+    nombre=${app:t}
+    base=${nombre%.app}
+    bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null)
+    instalada=$(defaults read "$app/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+    if [[ -e $app/Contents/_MASReceipt/receipt ]]; then
+      _adoptable_linea "" "$base" "$app" "$instalada" "" mas; continue
+    fi
+    if [[ $bid == com.apple.* ]]; then
+      _adoptable_linea "" "$base" "$app" "$instalada" "" apple; continue
+    fi
+    token=${app_cask[$app]}
+    estado=brew
+    if [[ -z $token && -n ${nombre_cask[$nombre]} ]]; then
+      token=${nombre_cask[$nombre]}
+      estado=fuera
+    fi
+    # Casks con paquete (Office, Teams, Zoom): no traen la app, pero si su bundle id (exacto o como
+    # final de una ruta de zap, ~/Library/Containers/com.microsoft.Excel) o un nombre igual al de la app
+    if [[ -z $token && -n $bid ]]; then
+      for t in ${(k)artefactos}; do
+        # Los casks con .app ya se comprobaron por su destino exacto, no por bundle id.
+        [[ ${artefactos[$t]} == *'"app":'* ]] && continue
+        [[ ${artefactos[$t]} == *"\"$bid\""* || ${artefactos[$t]} == *"/$bid\""* ]] && { token=$t; break }
+      done
+    fi
+    if [[ -z $token ]]; then
+      t=$(_cask_desde_nombre "$base")
+      if (( ${+artefactos[$t]} )) && [[ ${artefactos[$t]} != *'"app":'* ]]; then token=$t; fi
+    fi
+    if [[ -n $token ]]; then
+      [[ ${app:h} != ${CARPETAS_APPS[1]} && -z ${app_cask[$app]} ]] && estado=fuera
+      _adoptable_linea "$token" "$base" "$app" "$instalada" "" $estado; continue
+    fi
+    # "Visual Studio Code" -> visual-studio-code, "zoom.us" -> zoom
+    for t in "$(_cask_desde_nombre "$base")" "$(_cask_desde_nombre "${base// /}")" "$(_cask_desde_nombre "${${base%% *}%%.*}")"; do
+      if [[ ${#t} -ge 3 ]] && (( ${+existe[$t]} )); then
+        cand_token[$app]=$t
+        break
+      fi
+    done
+    (( ${+cand_token[$app]} )) || _adoptable_linea "" "$base" "$app" "$instalada" "" sincask
+  done
+
+  if (( ${#cand_token} )); then
+    if ! json=$(brew info --cask --json=v2 ${(u)${(v)cand_token}}); then
+      print -u2 -- "Error: no se pudieron consultar los casks disponibles para estas apps."
+      return 1
+    fi
+    if ! jq -e '(.casks | type) == "array" and all(.casks[];
+        (.token | type) == "string" and (.version | type) == "string" and
+        (.artifacts | type) == "array")' <<< "$json" >/dev/null 2>&1; then
+      print -u2 -- "Error: Homebrew devolvio datos no validos para los casks disponibles."
+      return 1
+    fi
+    # "-" cuando no hay apps: con IFS de tabulador, zsh junta dos tabuladores y correria las columnas
+    if ! filas=$(jq -r '.casks[] | [.token, .version, (.auto_updates // false | tostring),
+        ([.artifacts[] | .app? // empty | .[] | if type == "string" then . else (.target // empty) end]
+          | map(split("/") | last) | if length == 0 then "-" else join("|") end),
+        ((.disabled // false) | tostring), (.artifacts | tojson)] | @tsv' <<< "$json"); then
+      print -u2 -- "Error: no se pudieron interpretar los casks disponibles."
+      return 1
+    fi
+    while IFS=$'\t' read -r token version auto apps dis arts; do
+      [[ -n $token ]] || continue
+      info_version[$token]=$version info_auto[$token]=$auto info_apps[$token]=$apps
+      info_dis[$token]=$dis info_arts[$token]=$arts
+    done <<< "$filas"
+    for app in ${(k)cand_token}; do
+      token=${cand_token[$app]}
+      nombre=${app:t}
+      base=${nombre%.app}
+      bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null)
+      instalada=$(defaults read "$app/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+      version=${info_version[$token]}
+      if [[ -z $version ]]; then
+        print -u2 -- "Error: Homebrew no devolvio los datos del cask $token."
+        return 1
+      fi
+      apps=${info_apps[$token]}
+      estado=sincask
+      if [[ -z $version ]]; then
+        estado=sincask
+      elif [[ "|$apps|" == *"|$nombre|"* ]]; then
+        # Se instala la copia del cask, incluso cuando trae una version mas nueva.
+        # Para latest la comprobacion contra una version anterior se hace tras instalar, con respaldo.
+        if [[ $version == latest ]] || is-at-least "$instalada" "${version%%,*}"; then
+          estado=si
+        else
+          estado=version
+        fi
+      elif [[ $apps == - && -n $bid && ${info_arts[$token]} == *"\"$bid\""* ]]; then
+        # Cask con instalador: adoptarla es reinstalarla con su paquete oficial; nunca a una version vieja
+        if [[ $version != latest ]] && ! is-at-least "$instalada" "${version%%,*}"; then
+          estado=version
+        else
+          estado=paquete
+        fi
+      else
+        token=
+      fi
+      if [[ -n $token ]]; then
+        [[ ${info_dis[$token]} == true ]] && estado=deshabilitado
+        # brew adopta en /Applications (la primera carpeta): una copia en otra no se puede adoptar
+        [[ $estado == (si|paquete) && ${app:h} != ${CARPETAS_APPS[1]} ]] && estado=fuera
+      fi
+      _adoptable_linea "$token" "$base" "$app" "$instalada" "$version" $estado
+    done
+  fi
+
+  _titulo "Resumen"
+  print -r -- "  ${#todas} apps: $(( ${cuenta[si]:-0} + ${cuenta[fuera]:-0} )) para adoptar, ${cuenta[paquete]:-0} se reinstalan con su paquete, ${cuenta[brew]:-0} ya en Homebrew, ${cuenta[mas]:-0} de la App Store, ${cuenta[apple]:-0} de Apple, $(( ${cuenta[sincask]:-0} + ${cuenta[deshabilitado]:-0} + ${cuenta[version]:-0} )) sin adoptar."
+  return 0
+}
+
+# _adoptable_linea cask nombre ruta instalada version_cask estado
+_adoptable_linea() {
+  local token=$1 nombre=$2 ruta=$3 instalada=$4 version=$5 estado=$6 texto
+  (( cuenta[$estado]++ ))
+  case $estado in
+    (si) texto="se puede adoptar (cask $token)" ;;
+    (paquete) texto="se reinstala con su paquete (cask $token, $version)" ;;
+    (version) texto="el cask $token trae $version; no se baja de version" ;;
+    (brew) texto="ya en Homebrew (cask $token)" ;;
+    (mas) texto="App Store" ;;
+    (apple) texto="de Apple" ;;
+    (fuera) texto="se conserva el destino de Homebrew ($token) y se retira esta copia tras verificarlo" ;;
+    (deshabilitado) texto="su cask ($token) esta retirado en Homebrew" ;;
+    (*) texto="sin cask en Homebrew" ;;
+  esac
+  print -r -- "  $nombre${instalada:+ ($instalada)}: $texto"
+  _marca ADOPTABLE "$token" "$nombre" "$ruta" "$instalada" "$version" "$estado"
+}
+
+# Destino absoluto, tanto para el JSON del catalogo como para el inventario local.
+_destinos_cask() {
+  jq -er --arg destino "${CARPETAS_APPS[1]}" '.casks[0].artifacts[] | select(has("app")) |
+    (.target // ([.app[] | select(type == "object") | .target][0]) //
+      ([.app[] | select(type == "string")][0] | split("/") | last)) |
+    if startswith("/") then . else $destino + "/" + . end'
+}
+
+typeset -A ADOP_RESPALDOS
+CARPETA_RESPALDOS_APPS="$HOME/Library/Application Support/Actualizar/Respaldos/apps"
+
+_descartar_respaldo_adopcion() {
+  local carpeta=${1:h}
+  [[ ${carpeta:h} == $CARPETA_RESPALDOS_APPS && ${carpeta:A} == $carpeta && ! -L $carpeta ]] || return 1
+  rm -rf -- "$carpeta"
+}
+
+_restaurar_adopcion() {
+  local app respaldo apartado fallo=0
+  for app in ${(k)ADOP_RESPALDOS}; do
+    respaldo=${ADOP_RESPALDOS[$app]}
+    print -r -- "  Restaurando $app desde $respaldo"
+    if [[ -e $app || -L $app ]]; then
+      apartado=$(mktemp -d "${respaldo:h}/incompleta-XXXXXXXX") || return 1
+      if ! mv -- "$app" "$apartado/${app:t}"; then
+        print -u2 -- "Error: no se pudo restaurar $app. Respaldo conservado en $respaldo"
+        fallo=1; continue
+      fi
+    fi
+    if ditto "$respaldo" "$app"; then
+      unset "ADOP_RESPALDOS[$app]"
+      _descartar_respaldo_adopcion "$respaldo" || fallo=1
+    else
+      print -u2 -- "Error: restaura manualmente el respaldo $respaldo"
+      fallo=1
+    fi
+  done
+  return $fallo
+}
+
+_adoptar_cask() {
+  local token=$1 json despues app otra carpeta bid id version instalada ejecutable respaldo destinos accion
+  local -a originales objetivos ids respaldos_verificados
+  local -A identidades versiones verificadas
+  json=$(brew info --cask --json=v2 "$token") || return 1
+  jq -e --arg token "${token:t}" 'select((.casks | length) == 1) | .casks[0] |
+    .token == $token and (.version | type) == "string" and
+    (.artifacts | type) == "array" and (.disabled != true)' <<< "$json" >/dev/null 2>&1 || {
+    print -u2 -- "Error: cask no valido o retirado: $token"; return 1
+  }
+  version=$(jq -r '.casks[0].version' <<< "$json")
+  # Nunca se recorre /System ni se siguen enlaces para buscar originales.
+  for carpeta in ${CARPETAS_APPS[1,2]}; do
+    for app in "$carpeta"/*.app(N) "$carpeta"/*/*.app(N); do
+      [[ -L $app || -L ${app:h} || -e $app/Contents/_MASReceipt/receipt ]] && continue
+      bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null)
+      [[ -n $bid && $bid != com.apple.* ]] && originales+=("$app")
+    done
+  done
+  if destinos=$(_destinos_cask <<< "$json"); then
+    objetivos=(${(f)destinos})
+  elif jq -e 'any(.casks[0].artifacts[]; has("pkg"))' <<< "$json" >/dev/null; then
+    # Los paquetes no declaran rutas .app; solo se aceptan identidades exactas de sus artefactos.
+    for app in $originales; do
+      bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null)
+      if jq -e --arg bid "$bid" '[.casks[0].artifacts[] | .. | strings] |
+          any(. == $bid or endswith("/" + $bid))' <<< "$json" >/dev/null; then
+        otra="${CARPETAS_APPS[1]}/${app:t}"
+        objetivos+=("$otra")
+        identidades[$otra]=$bid
+      fi
+    done
+    objetivos=(${(u)objetivos})
+  fi
+  (( $#objetivos )) || { print -u2 -- "Error: no se pudo determinar la app que instala $token"; return 1; }
+  # Si ya esta registrada y sana, solo hay que retirar las copias adicionales.
+  accion=install
+  if jq -e '.casks[0].installed | type == "string" and length > 0' <<< "$json" >/dev/null; then
+    accion=reinstall
+    local sanas=1
+    for app in $objetivos; do
+      ejecutable=$(defaults read "$app/Contents/Info" CFBundleExecutable 2>/dev/null)
+      [[ -n $ejecutable && -x $app/Contents/MacOS/$ejecutable ]] || sanas=0
+    done
+    (( sanas )) && accion=
+  fi
+  # Antes de usar --force: destinos limitados y una identidad inequivoca por app.
+  for app in $objetivos; do
+    [[ $app == /*.app && ${app:A} == $app && ! -L $app && ! -L ${app:h} &&
+       ( ${app:h} == ${CARPETAS_APPS[1]} || ${app:h} == ${CARPETAS_APPS[2]} ||
+         ${app:h} == ${CARPETAS_APPS[1]}/Utilities ) ]] || {
+      print -u2 -- "Error: destino no seguro para reemplazar: $app"; return 1
+    }
+    for otra in "$app" $originales; do
+      [[ -d $otra && ( $otra == $app || ${otra:t} == ${app:t} ) ]] || continue
+      bid=$(defaults read "$otra/Contents/Info" CFBundleIdentifier 2>/dev/null)
+      [[ -n $bid && $bid != com.apple.* && ! -e $otra/Contents/_MASReceipt/receipt ]] || return 1
+      if [[ -n ${identidades[$app]} && ${identidades[$app]} != $bid ]]; then
+        print -u2 -- "Error: hay apps distintas con el nombre ${app:t}; no se reemplazan."; return 1
+      fi
+      identidades[$app]=$bid
+      instalada=$(defaults read "$otra/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+      if [[ -n $accion && -n $instalada && $version != latest ]] && ! is-at-least "$instalada" "${version%%,*}"; then
+        print -u2 -- "Error: $otra es mas nueva que el cask $version; no se baja de version."; return 1
+      fi
+      if [[ -n $instalada ]] && { [[ -z ${versiones[$app]} ]] || is-at-least "${versiones[$app]}" "$instalada"; }; then
+        versiones[$app]=$instalada
+      fi
+    done
+  done
+  if [[ -n $accion ]]; then
+    for app in $objetivos; do
+      [[ -e $app ]] || continue
+      carpeta=$CARPETA_RESPALDOS_APPS
+      mkdir -p "$carpeta" || return 1
+      respaldo=$(mktemp -d "$carpeta/${token:t}-XXXXXXXX") || return 1
+      respaldo="$respaldo/${app:t}"
+      ditto "$app" "$respaldo" || return 1
+      ADOP_RESPALDOS[$app]=$respaldo
+      print -r -- "  Respaldo de la original: $respaldo"
+    done
+    if ! brew "$accion" --cask --force --appdir="${CARPETAS_APPS[1]}" "$token"; then
+      _restaurar_adopcion
+      return 1
+    fi
+  fi
+  # No basta el codigo de salida: el recibo y cada bundle deben existir y corresponder.
+  despues=$(brew info --cask --json=v2 --installed "$token") || { _restaurar_adopcion; return 1; }
+  # --installed devuelve TODOS los casks aunque se indique un token: filtrar antes de verificar.
+  if ! despues=$(jq -ec --arg token "${token:t}" 'select((.casks | type) == "array") |
+      .casks |= map(select(.token == $token)) |
+      select((.casks | length) == 1 and (.casks[0].installed | type == "string" and length > 0))' \
+      <<< "$despues") ||
+      { [[ -n $destinos ]] && [[ $(_destinos_cask <<< "$despues") != $destinos ]]; }; then
+    print -u2 -- "Error: Homebrew no confirmo la instalacion en su destino esperado."
+    _restaurar_adopcion; return 1
+  fi
+  for app in $objetivos; do
+    bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null)
+    ejecutable=$(defaults read "$app/Contents/Info" CFBundleExecutable 2>/dev/null)
+    instalada=$(defaults read "$app/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+    if [[ -z $bid || $bid == com.apple.* || -L $app || -z $ejecutable || ! -x $app/Contents/MacOS/$ejecutable ||
+          -z $instalada || ( -n ${identidades[$app]} && $bid != ${identidades[$app]} ) ]] ||
+        { [[ -n ${versiones[$app]} ]] && ! is-at-least "${versiones[$app]}" "$instalada"; }; then
+      print -u2 -- "Error: no se pudo verificar la app instalada: $app"
+      _restaurar_adopcion; return 1
+    fi
+    identidades[$app]=$bid
+    verificadas[$bid]=$instalada
+  done
+  respaldos_verificados=("${(@v)ADOP_RESPALDOS}")
+  ADOP_RESPALDOS=()
+  for respaldo in $respaldos_verificados; do
+    if ! _descartar_respaldo_adopcion "$respaldo"; then
+      print -u2 -- "Error: instalacion verificada, pero no se pudo borrar el respaldo temporal $respaldo"
+      return 1
+    fi
+  done
+  # Solo las copias que ya existian y comparten bundle id. Nunca datos, preferencias ni recibos.
+  ids=("${(@v)identidades}")
+  for otra in $originales; do
+    (( ${objetivos[(Ie)$otra]} )) && continue
+    bid=$(defaults read "$otra/Contents/Info" CFBundleIdentifier 2>/dev/null)
+    [[ -n $bid && ${otra:A} == $otra && ! -L $otra ]] || continue
+    (( ${ids[(Ie)$bid]} )) || continue
+    instalada=$(defaults read "$otra/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+    if [[ -z $instalada ]] || ! is-at-least "$instalada" "${verificadas[$bid]}"; then
+      print -u2 -- "Error: se conserva $otra; no se pudo confirmar que Homebrew tenga una version igual o mas nueva."
+      return 1
+    fi
+    if ! rm -rf -- "$otra" || [[ -e $otra || -L $otra ]]; then
+      print -u2 -- "Error: Homebrew esta verificado, pero no se pudo eliminar definitivamente $otra"; return 1
+    fi
+    print -r -- "  Original duplicada eliminada definitivamente: $otra"
+  done
+  print -r -- "  Verificada: queda la app gestionada por Homebrew."
+}
+
+_adoptar_todo() {
+  local token
+  local -a adoptadas fallidas
+  if (( ! $#SEL_CASKS )); then
+    print -r -- "Nada que adoptar: indica los casks con --casks a,b (ver actualizar adoptables)."
+    return 2
+  fi
+  for token in $SEL_CASKS; do
+    _titulo "Adoptando $token"
+    if _adoptar_cask "$token"; then
+      adoptadas+=($token)
+      _marca ADOPTADA $token ok
+    else
+      _restaurar_adopcion
+      fallidas+=($token)
+      _marca ADOPTADA $token error
+      (( ${#ADOP_RESPALDOS} )) && break
+    fi
+  done
+  _titulo "Resumen"
+  (( $#adoptadas )) && print -r -- "  Adoptadas: ${(j:, :)adoptadas}"
+  (( $#fallidas )) && print -r -- "  No se pudieron adoptar: ${(j:, :)fallidas} (detalle arriba)"
+  (( ! $#fallidas ))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Ejecucion de etapas
+
+# Deja en ESTADO/N_ITEMS el resultado de la etapa
+_correr_etapa() {
+  local modo=$1 e=$2 rc
+  N_ITEMS=0
+  _titulo $TITULO[$e]
+  if [[ $e == microsoft ]] && _ms_pausado; then
+    ESTADO=pausada
+    _nota microsoft "Microsoft AutoUpdate en pausa. Las apps gestionadas por Homebrew siguen revisandose por esa fuente."
+    _marca FIN $e $ESTADO 0 0
+    return 0
+  fi
+  _${modo}_$e
+  rc=$?
+  # Al instalar, un fallo pesa mas que los avisos que hayan quedado
+  if [[ $modo == instalar ]] && (( rc )); then
+    ESTADO=error
+  elif (( N_ITEMS )); then
+    ESTADO=pendiente
+  elif (( rc )); then
+    ESTADO=error
+  elif [[ $modo == revisar ]]; then
+    ESTADO=aldia
+    print -r -- "  Al dia."
+  else
+    ESTADO=hecho
+  fi
+  _marca FIN $e $ESTADO $N_ITEMS $rc
+}
+
+# Revisa todas las etapas a la vez (brew update antes que formulas y casks) y muestra cada una
+# completa en cuanto termina, para que no se mezclen las salidas
+_revisar_todo() {
+  local tmp=$(mktemp -d -t actualizar) e g estado n
+  TMP_REVISION=$tmp
+  local -a grupos=(propios "formulas casks" mas sparkle manuales macos microsoft) faltan errores pausadas
+  local -i total=0
+  for e in $ETAPAS_ACTIVAS; do _marca ETAPA $e revisar; done
+  for g in $grupos; do
+    (
+      for e in ${=g}; do
+        (( ${ETAPAS_ACTIVAS[(Ie)$e]} )) || continue
+        _correr_etapa revisar $e > $tmp/$e 2>&1 < /dev/null
+        print -r -- "$ESTADO $N_ITEMS" > $tmp/$e.fin
+      done
+    ) &
+  done
+  faltan=($ETAPAS_ACTIVAS)
+  while (( $#faltan )); do
+    for e in $faltan; do
+      [[ -e $tmp/$e.fin ]] || continue
+      cat $tmp/$e
+      read -r estado n < $tmp/$e.fin
+      (( total += n ))
+      [[ $estado == error ]] && errores+=($e)
+      [[ $estado == pausada ]] && pausadas+=($e)
+      faltan=(${faltan:#$e})
+    done
+    (( $#faltan )) && sleep 0.3
+  done
+  wait
+  rm -rf $tmp
+  TMP_REVISION=
+  _titulo "Resumen"
+  case $total in
+    (0) print -r -- "  Sin pendientes en las fuentes revisadas." ;;
+    (1) print -r -- "  1 pendiente." ;;
+    (*) print -r -- "  $total pendientes." ;;
+  esac
+  (( $#pausadas )) && print -r -- "  En pausa (no revisadas): ${(j:, :)pausadas}"
+  (( $#errores )) && print -r -- "  No se pudo revisar del todo: ${(j:, :)errores}"
+  print -r -- "  Revision en $(_duracion $SECONDS). Instala con: actualizar instalar"
+  (( ! $#errores ))
+}
+
+_instalar_todo() {
+  local e
+  local -a errores manuales pausadas
+  if [[ "$ETAPAS_ACTIVAS" == microsoft ]] && _ms_pausado; then
+    _marca ETAPA microsoft instalar
+    _correr_etapa instalar microsoft
+    return 0
+  fi
+  # Sin autorizacion por adelantado: lo comun (formulas y apps sin paquete) no la necesita, y brew 7
+  # borra la de sudo al comprobar si puede usarlo, asi que tampoco le servia. sudo pide Touch ID (o la
+  # contrasena con la tapa cerrada) solo en el paso que la necesita (paquetes .pkg, App Store,
+  # AdGuard); la que se de se mantiene viva mientras corre y se borra al terminar
+  ( while sleep 50; do sudo -n -v 2>/dev/null; done ) &!
+  SUDO_VIVO=$!
+  for e in $ETAPAS_ACTIVAS; do
+    _marca ETAPA $e instalar
+    _correr_etapa instalar $e
+    [[ $ESTADO == error ]] && errores+=($e)
+    [[ $ESTADO == pendiente ]] && manuales+=($e)
+    [[ $ESTADO == pausada ]] && pausadas+=($e)
+  done
+  _titulo "Resumen"
+  if (( $#errores )); then
+    print -r -- "  Con errores: ${(j:, :)errores} (detalle arriba)"
+  else
+    print -r -- "  Sin errores."
+  fi
+  (( $#pausadas )) && print -r -- "  En pausa (no actualizadas): ${(j:, :)pausadas}"
+  (( $#manuales )) && print -r -- "  Requieren accion manual: ${(j:, :)manuales}"
+  print -r -- "  actualizar termino en $(_duracion $SECONDS)"
+  (( ! $#errores ))
+}
+
+_limpiar() {
+  # Solo el proceso principal: los subshells heredan las trampas
+  [[ $sysparams[pid] == $PID_PRINCIPAL ]] || return 0
+  (( ${#ADOP_RESPALDOS} )) && _restaurar_adopcion
+  [[ -n $TMP_REVISION ]] && rm -rf $TMP_REVISION
+  if [[ -n $SUDO_VIVO ]]; then
+    kill $SUDO_VIVO 2>/dev/null
+    sudo -k
+    SUDO_VIVO=
+  fi
+}
+
+_ayuda() {
+  sed -n '2,15p' "$MOTOR" | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------------------------------------
+
+MODO=instalar
+case $1 in
+  (revisar|instalar|adoptables|adoptar) MODO=$1; shift ;;
+  (-h|--help|ayuda) _ayuda; exit 0 ;;
+esac
+
+BETAS=
+ETAPAS_ACTIVAS=($ETAPAS)
+typeset -a SEL_PROPIOS SEL_FORMULAS SEL_CASKS SEL_MAS
+while (( $# )); do
+  case $1 in
+    (--betas)    BETAS=--betas ;;
+    (--etapas)   ETAPAS_ACTIVAS=(${(s:,:)2}); shift ;;
+    (--propios)  SEL_PROPIOS=(${(s:,:)2}); shift ;;
+    (--formulas) SEL_FORMULAS=(${(s:,:)2}); shift ;;
+    (--casks)    SEL_CASKS=(${(s:,:)2}); shift ;;
+    (--mas)      SEL_MAS=(${(s:,:)2}); shift ;;
+    (-h|--help)  _ayuda; exit 0 ;;
+    (*) print -u2 -r -- "actualizar: opcion desconocida: $1 (ver actualizar --help)"; exit 2 ;;
+  esac
+  shift
+done
+for e in $ETAPAS_ACTIVAS; do
+  (( ${ETAPAS[(Ie)$e]} )) || { print -u2 -r -- "actualizar: etapa desconocida: $e"; exit 2 }
+done
+# Siempre en el orden de ETAPAS, aunque --etapas venga en otro
+ETAPAS_ACTIVAS=(${ETAPAS:*ETAPAS_ACTIVAS})
+
+PID_PRINCIPAL=$sysparams[pid]
+SUDO_VIVO=
+TMP_REVISION=
+BREW_ACTUALIZADO=0
+trap _limpiar EXIT
+TRAPINT() {
+  if [[ $sysparams[pid] == $PID_PRINCIPAL ]]; then
+    print -r -- ""
+    print -r -- "==> Cancelado"
+    _marca CANCELADO
+  fi
+  exit 130
+}
+TRAPHUP()  { exit 129 }
+TRAPTERM() { exit 143 }
+
+SECONDS=0
+_marca INICIO $MODO
+_${MODO}_todo
